@@ -1,0 +1,13 @@
+{
+	"/(auth)": [],
+	"/(app)": [],
+	"/": [],
+	"/(app)/dashboard": [],
+	"/(app)/devices": [],
+	"/(app)/devices/pair": [],
+	"/(auth)/login": [],
+	"/(app)/logs": [],
+	"/(auth)/register": [],
+	"/(app)/rules": [],
+	"/(app)/settings": []
+}
