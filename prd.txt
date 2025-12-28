@@ -1,0 +1,235 @@
+================================================================================
+PROJECT SPECIFICATION: TingHook (Android SMS & Notification Gateway SaaS)
+DATE: 2025-12-28
+VERSION: 1.0.0 (MVP)
+AUTHOR: Solo Builder
+STACK: Golang (BE) + SvelteKit (FE) + Android (Kotlin/C++)
+================================================================================
+
+1. PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+**TingHook** is a SaaS platform that turns Android devices into programmable SMS Gateways and Notification Listeners via API/Webhooks.
+- **Core Function:** Relay SMS/Notifications from Android -> Webhook. Send SMS from API -> Android.
+- **Business Model:** Subscription (Free, Solo, Team).
+- **Key Characteristics:** High performance, Real-time, Native C++ logic for Android security.
+
+2. TECHNOLOGY STACK
+--------------------------------------------------------------------------------
+A. Backend (Server)
+- **Language:** Golang (1.23+)
+- **Web Framework:** Fiber v2 (https://gofiber.io)
+- **Database:** PostgreSQL (v16+)
+- **Cache/Queue:** Redis (v7+)
+- **Task Queue:** Asynq (github.com/hibiken/asynq) for webhook dispatching with retries.
+- **WebSocket:** github.com/gofiber/contrib/websocket
+- **ORM:** GORM (gorm.io) or sqlc.
+
+B. Frontend (Dashboard)
+- **Framework:** SvelteKit (Node adapter)
+- **Styling:** TailwindCSS
+- **Components:** Shadcn-Svelte or Bits UI
+- **State:** Svelte Stores + TanStack Query (Svelte Query)
+- **Icons:** Lucide-Svelte
+
+C. Android Client (Gateway App)
+- **Language:** Kotlin (UI & Android APIs) + C++ 17 (Core Logic & Networking).
+- **Build System:** Gradle + CMake.
+- **Communication:** JNI (Java Native Interface).
+- **Key Libraries:**
+  - C++: `nlohmann/json` (JSON parsing).
+  - Kotlin: `WorkManager`, `ForegroundService`.
+
+3. DATABASE SCHEMA (PostgreSQL)
+--------------------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. USERS
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    api_key VARCHAR(64) UNIQUE NOT NULL, -- Secret key for external API auth
+    subscription_plan VARCHAR(20) DEFAULT 'free', -- 'free', 'solo', 'team'
+    credits INT DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 2. DEVICES
+CREATE TABLE devices (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(100),
+    device_uid VARCHAR(100) UNIQUE NOT NULL, -- Hardware ID/Android ID
+    fcm_token TEXT,
+    status VARCHAR(20) DEFAULT 'offline', -- 'online', 'offline'
+    battery_level INT DEFAULT 0,
+    app_version VARCHAR(20),
+    last_seen_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 3. FORWARDING RULES (Logic to send webhooks)
+CREATE TABLE forwarding_rules (
+    id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    device_id UUID REFERENCES devices(id) ON DELETE CASCADE, -- NULL means apply to all user's devices
+    trigger_type VARCHAR(50) NOT NULL, -- 'SMS_RECEIVED', 'NOTIFICATION_RECEIVED', 'MISSED_CALL'
+    
+    -- Filter Logic
+    sender_filter VARCHAR(255), -- Regex or exact match for Sender (e.g., "Vietcombank")
+    content_filter TEXT, -- Regex or keyword match
+    
+    -- Action Logic
+    webhook_url TEXT NOT NULL,
+    secret_header TEXT, -- Optional header for security
+    method VARCHAR(10) DEFAULT 'POST',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 4. MESSAGE LOGS (History & Queue)
+CREATE TABLE message_logs (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID REFERENCES users(id),
+    device_id UUID REFERENCES devices(id),
+    direction VARCHAR(10) NOT NULL, -- 'INBOUND' (From Android), 'OUTBOUND' (To Android)
+    sim_slot INT DEFAULT 0, -- 0 or 1
+    
+    sender VARCHAR(50), -- Phone number or App Name
+    receiver VARCHAR(50),
+    content TEXT,
+    
+    status VARCHAR(20) DEFAULT 'PENDING', -- 'PENDING', 'SENT', 'DELIVERED', 'FAILED', 'WEBHOOK_SENT', 'WEBHOOK_FAILED'
+    error_message TEXT,
+    retry_count INT DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processed_at TIMESTAMP WITH TIME ZONE
+);
+
+4. BACKEND IMPLEMENTATION DETAILS (Golang)
+--------------------------------------------------------------------------------
+4.1. Project Structure
+/cmd/server/main.go       # Entry point
+/internal/
+  /models                 # GORM struct definitions
+  /handlers               # HTTP Controllers (Auth, Device, Rules)
+  /repository             # DB interactions
+  /services               # Business logic
+  /websockets             # Hub, Client management
+  /workers                # Asynq tasks (Webhook dispatcher)
+/pkg/
+  /utils                  # Helper functions (Hash, Validators)
+/config/                  # Env loading
+
+4.2. WebSocket Hub Logic (`internal/websockets`)
+- **Hub Struct:** Maintains a thread-safe map of connected clients.
+  - `Clients map[UserID]map[DeviceID]*Client`
+  - `Register chan *Client`
+  - `Unregister chan *Client`
+  - `Broadcast chan Message`
+- **Protocol (JSON):**
+  - **Ping:** `{ "type": "PING" }`
+  - **Command:** `{ "type": "SEND_SMS", "data": { "phone": "...", "msg": "...", "sim": 0 } }`
+  - **Event:** `{ "type": "SMS_RECEIVED", "data": { ... } }`
+
+4.3. API Endpoints
+- `POST /api/auth/register` & `POST /api/auth/login` (Returns JWT).
+- `GET /api/devices` (List user devices).
+- `POST /api/v1/sms/send` (Public API for users).
+  - Headers: `X-API-Key: <user_api_key>`
+  - Logic: Validate Key -> Find User -> Check Quota -> Find Online Device -> Push to WebSocket -> Create Log (Pending).
+- `POST /api/webhook/test` (Test webhook for user).
+
+4.4. Background Worker (Asynq)
+- **Task:** `Type: "dispatch:webhook"`
+- **Payload:** `{ "rule_id": 1, "log_id": 100, "data": { ... } }`
+- **Logic:** Fetch Rule -> Fetch Log Data -> HTTP POST to `rule.webhook_url` -> Update Log Status.
+- **Retry:** Max 3 retries, exponential backoff.
+
+5. ANDROID CLIENT IMPLEMENTATION DETAILS
+--------------------------------------------------------------------------------
+5.1. Architecture (Kotlin + C++)
+- **Kotlin:** Handles UI, Android System Permissions, Services, `SmsManager`, `NotificationListenerService`.
+- **C++ (Native):** Handles WebSocket connection state, JSON serialization, and "Secret" logic.
+
+5.2. Native Interface (JNI) - `src/main/cpp/native-lib.cpp`
+// 1. Initialize & Connect
+extern "C" JNIEXPORT void JNICALL
+Java_com_tinghook_gateway_service_NativeEngine_connect(JNIEnv* env, jobject thiz, jstring apiKey, jstring deviceId);
+
+// 2. Push Event (From Kotlin -> C++ -> Server)
+extern "C" JNIEXPORT void JNICALL
+Java_com_tinghook_gateway_service_NativeEngine_pushEvent(JNIEnv* env, jobject thiz, jstring eventType, jstring jsonData);
+
+// 3. Disconnect
+extern "C" JNIEXPORT void JNICALL
+Java_com_tinghook_gateway_service_NativeEngine_disconnect(JNIEnv* env, jobject thiz);
+
+5.3. Kotlin Callbacks (C++ -> Kotlin)
+The C++ code should call back to Kotlin methods when it receives a command from the Server.
+- `void onServerCommand(String commandJson)`:
+  - If command is `SEND_SMS` -> Kotlin parses JSON -> Calls `SmsManager`.
+
+5.4. Services
+- **`GatewayService` (Foreground Service):**
+  - Starts `NativeEngine.connect()` on create.
+  - Keeps a persistent notification: "TingHook Gateway is active".
+  - Acquires `WakeLock` to prevent CPU sleep (optional, handle with care).
+- **`SmsReceiver` (BroadcastReceiver):**
+  - On `SMS_RECEIVED` -> `NativeEngine.pushEvent("SMS_IN", data)`.
+- **`NotifListener` (NotificationListenerService):**
+  - On `onNotificationPosted` -> Filter package name -> `NativeEngine.pushEvent("NOTIF_IN", data)`.
+
+6. FRONTEND IMPLEMENTATION DETAILS (SvelteKit)
+--------------------------------------------------------------------------------
+6.1. Routes
+- `/` -> Landing Page.
+- `/login`, `/register` -> Auth.
+- `/dashboard` -> Main overview (Device stats).
+- `/dashboard/devices` -> List devices, QR Code for pairing.
+- `/dashboard/rules` -> CRUD Webhook rules.
+- `/dashboard/logs` -> Message history (Paginated).
+- `/docs` -> API Documentation.
+
+6.2. Features
+- **Real-time Log Console:**
+  - Connect to Backend via WebSocket (frontend-only channel) to stream logs for the specific logged-in user.
+- **QR Pairing:**
+  - Generate a QR code containing `{ "apiKey": "...", "serverUrl": "wss://api.tinghook.com" }`.
+  - Android App scans this to auto-login.
+
+7. DEPLOYMENT & ENV
+--------------------------------------------------------------------------------
+Docker Compose:
+services:
+  backend:
+    build: ./backend
+    ports: ["8080:8080"]
+    environment:
+      - DB_DSN=host=postgres user=postgres password=secret dbname=tinghook port=5432 sslmode=disable
+      - REDIS_ADDR=redis:6379
+  
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_PASSWORD=secret
+      - POSTGRES_DB=tinghook
+      
+  redis:
+    image: redis:7-alpine
+
+8. BUSINESS LOGIC (Tier Constraints)
+--------------------------------------------------------------------------------
+- **Free Plan:**
+  - Max Devices: 1.
+  - Append signature "[Sent via TingHook]" to outbound SMS content.
+  - Rate limit API: 10 req/min.
+- **Solo Plan ($4/mo):**
+  - Max Devices: 2.
+  - No signature.
+  - Priority Queue.
+- **Team Plan ($12/mo):**
+  - Max Devices: 10.
+  - High Rate limit.
+================================================================================
